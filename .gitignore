@@ -1,0 +1,4 @@
+*.db
+._*
+.DS_Store
+__MACOSX/
