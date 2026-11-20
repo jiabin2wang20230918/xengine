@@ -2,212 +2,127 @@ package watch
 
 import (
 	"encoding/json"
-	"github.com/jiabin2wang20230918/xengine/scene"
-	"github.com/jiabin2wang20230918/xengine/utils/log"
+	"fmt"
+	"sync"
 	"testing"
 	"time"
+
+	"github.com/kubeedge/beehive/pkg/common"
+	beehiveContext "github.com/kubeedge/beehive/pkg/core/context"
+	"github.com/kubeedge/beehive/pkg/core/model"
+
+	"github.com/jiabin2wang20230918/xengine/scene"
+	"github.com/jiabin2wang20230918/xengine/shadow"
+	"github.com/jiabin2wang20230918/xengine/utils"
 )
 
-func TestWatch(t *testing.T) {
-	log.InitInnerLog(log.GetLog())
-	s := `{
-    "id": 123,
-	"triggers": [
-		{
-		  "deviceId": "d-1",
-		  "identifier": "onOff",
-		  "type": "property",
-		  "value": 1,
-		  "condition": "=="
-		},
-		{
-		  "deviceId": "d-2",
-		  "identifier": "onOff",
-		  "type": "property",
-		  "value": 0,
-		  "condition": "=="
-		},
-		{
-		  "deviceId": "d-3",
-		  "identifier": "warn",
-		  "type": "event"
-		},
-		{
-		  "deviceId": "d-4",
-		  "identifier": "boom",
-		  "type": "event"
-		},
-		{
-		  "time": "0 0/1 * * * * *",
-		  "type": "timer"
+func TestWatchPropertyAndEventTriggers(t *testing.T) {
+	const modName = "watchTestReceiver"
+	beehiveContext.InitContext([]string{common.MsgCtxTypeChannel})
+	beehiveContext.AddModule(&common.ModuleInfo{
+		ModuleName: modName,
+		ModuleType: common.MsgCtxTypeChannel,
+	})
+	defer beehiveContext.Cleanup(modName)
+
+	received := make(chan model.Message, 8)
+	go func() {
+		for {
+			msg, err := beehiveContext.Receive(modName)
+			if err != nil {
+				return
+			}
+			received <- msg
 		}
-	],
-	"conditions": [
-		{
-		  "deviceId": "d-5",
-		  "identifier": "lightness",
-		  "type": "property",
-		  "value": 50,
-		  "condition": ">="
-		},
-		{
-		  "time": "* * * * * 3,4,5,6,7 *",
-		  "startTime": "13:22",
-		  "endTime": "17:33",
-		  "type": "timer"
-		}
-	]
-}
-`
-	b := []byte(s)
+	}()
+
+	rawScene := `{
+		"id": 123,
+		"triggers": [
+			{"deviceId": "d-1", "identifier": "onOff", "type": "property", "value": 1, "condition": "=="},
+			{"deviceId": "d-3", "identifier": "warn", "type": "event"}
+		],
+		"conditions": [
+			{"deviceId": "d-5", "identifier": "lightness", "type": "property", "value": 50, "condition": ">="}
+		]
+	}`
 	p := &scene.SceneParams{}
-	err := json.Unmarshal(b, p)
-	if err != nil {
-		t.Errorf("err:%v", err)
-		return
+	if err := json.Unmarshal([]byte(rawScene), p); err != nil {
+		t.Fatalf("unmarshal scene: %v", err)
 	}
-	err = scene.AddScene(p)
-	if err != nil {
-		t.Errorf("err:%v", err)
-		return
+	p.ActionNotifyModuleName = modName
+	if err := scene.AddScene(p); err != nil {
+		t.Fatalf("AddScene: %v", err)
 	}
+	defer scene.RemoveScene(123)
 
-	// 定时触发触发器
-	go func() {
-		for {
-			var topic string
-			var payload []byte
-			// /sys/%v/%v/thing/event/property/post
-			// /sys/%v/%v/thing/event/%v/post
-			topic = "/sys/pk/d-1/thing/event/property/post"
-			payload = []byte(`
-{
-	"Id":"123",
-    "version":"1.0",
-    "timezone":"Asia/Shanghai",
-    "params":{
-        "onOff":{
-            "value":1,
-            "time":1524448722000
-        }
+	// Condition unmet (lightness=10 < 50): property trigger should update shadow but not recall.
+	if err := Watch("/sys/pk/d-5/thing/event/property/post", []byte(`{"params":{"lightness":{"value":10,"time":1}}}`)); err != nil {
+		t.Fatalf("watch d-5: %v", err)
+	}
+	if v, ok := shadow.GetPropertyShadow("d-5", "lightness"); !ok || v != float64(10) {
+		t.Fatalf("shadow d-5 lightness = (%v, %v), want (10, true)", v, ok)
+	}
+	if err := Watch("/sys/pk/d-1/thing/event/property/post", []byte(`{"params":{"onOff":{"value":1,"time":2}}}`)); err != nil {
+		t.Fatalf("watch d-1: %v", err)
+	}
+	select {
+	case msg := <-received:
+		t.Fatalf("unexpected recall when condition unmet: %+v", msg)
+	case <-time.After(100 * time.Millisecond):
 	}
 
-}
-`)
-			t.Logf("watch topic:%s payload:%s", topic, payload)
-			err := Watch(topic, payload)
-			if err != nil {
-				t.Errorf("err:%v", err)
-				return
-			}
-			time.Sleep(5 * time.Second)
-			// ---------------
-			topic = "/sys/pk/d-2/thing/event/property/post"
-			payload = []byte(`
-{
-	"Id":"123",
-    "version":"1.0",
-    "timezone":"Asia/Shanghai",
-    "params":{
-        "onOff":{
-            "value":0,
-            "time":1524448722000
-        }
+	// Condition met (lightness=80 >= 50): property trigger should dispatch recall.
+	if err := Watch("/sys/pk/d-5/thing/event/property/post", []byte(`{"params":{"lightness":{"value":80,"time":3}}}`)); err != nil {
+		t.Fatalf("watch d-5 high: %v", err)
 	}
-
-}
-`)
-			t.Logf("watch topic:%s payload:%s", topic, payload)
-			err = Watch(topic, payload)
-			if err != nil {
-				t.Errorf("err:%v", err)
-				return
-			}
-			time.Sleep(5 * time.Second)
-			// ---------------
-			topic = "/sys/pk/d-3/thing/event/warn/post"
-			payload = []byte(`
-{
-	
-}
-`)
-			t.Logf("watch topic:%s payload:%s", topic, payload)
-			err = Watch(topic, payload)
-			if err != nil {
-				t.Errorf("err:%v", err)
-				return
-			}
-			time.Sleep(5 * time.Second)
-
-			// ---------------
-			topic = "/sys/pk/d-4/thing/event/boom/post"
-			payload = []byte(`
-{
-	
-}
-`)
-			t.Logf("watch topic:%s payload:%s", topic, payload)
-			err = Watch(topic, payload)
-			if err != nil {
-				t.Errorf("err:%v", err)
-				return
-			}
-			time.Sleep(5 * time.Second)
-
+	if err := Watch("/sys/pk/d-1/thing/event/property/post", []byte(`{"params":{"onOff":{"value":1,"time":4}}}`)); err != nil {
+		t.Fatalf("watch d-1 trigger: %v", err)
+	}
+	select {
+	case msg := <-received:
+		if msg.GetOperation() != utils.SceneActionRecallOperation || msg.GetContent() != uint16(123) {
+			t.Fatalf("unexpected recall message: op=%q content=%v", msg.GetOperation(), msg.GetContent())
 		}
-	}()
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for property-triggered scene recall")
+	}
 
-	// 定时更新条件
-	go func() {
-		for {
-			var topic string
-			var payload []byte
-			// /sys/%v/%v/thing/event/property/post
-			// /sys/%v/%v/thing/event/%v/post
-			topic = "/sys/pk/d-5/thing/event/property/post"
-			payload = []byte(`
-{
-	"Id":"123",
-    "version":"1.0",
-    "timezone":"Asia/Shanghai",
-    "params":{
-        "lightness":{
-            "value":1,
-            "time":1524448722000
-        }
+	// Event trigger should also dispatch recall.
+	if err := Watch("/sys/pk/d-3/thing/event/warn/post", []byte(`{}`)); err != nil {
+		t.Fatalf("watch d-3 event: %v", err)
 	}
-}
-`)
-			t.Logf("watch topic:%s payload:%s", topic, payload)
-			err := Watch(topic, payload)
-			if err != nil {
-				t.Errorf("err:%v", err)
-				return
-			}
-			time.Sleep(30 * time.Second)
-			topic = "/sys/pk/d-5/thing/event/property/post"
-			payload = []byte(`
-{
-	"Id":"123",
-    "version":"1.0",
-    "timezone":"Asia/Shanghai",
-    "params":{
-        "lightness":{
-            "value":100,
-            "time":1524448722000
-        }
-	}
-}
-`)
-			t.Logf("watch topic:%s payload:%s", topic, payload)
-			err = Watch(topic, payload)
-			if err != nil {
-				t.Errorf("err:%v", err)
-				return
-			}
-			time.Sleep(30 * time.Second)
+	select {
+	case msg := <-received:
+		if msg.GetOperation() != utils.SceneActionRecallOperation || msg.GetContent() != uint16(123) {
+			t.Fatalf("unexpected event recall message: op=%q content=%v", msg.GetOperation(), msg.GetContent())
 		}
-	}()
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for event-triggered scene recall")
+	}
+}
 
-	select {}
+func TestWatchEdgeCasesAndConcurrency(t *testing.T) {
+	if err := Watch("/short", []byte(`{}`)); err != nil {
+		t.Fatalf("short topic returned error: %v", err)
+	}
+	if err := Watch("/sys/pk/d-1/thing/event/property/post", []byte(`{invalid`)); err == nil {
+		t.Fatal("expected error for malformed property payload")
+	}
+
+	var wg sync.WaitGroup
+	for g := 0; g < 6; g++ {
+		wg.Add(1)
+		go func(id int) {
+			defer wg.Done()
+			topic := fmt.Sprintf("/sys/pk/dev-%d/thing/event/property/post", id)
+			payload := []byte(`{"params":{"temp":{"value":25,"time":1}}}`)
+			for i := 0; i < 50; i++ {
+				if err := Watch(topic, payload); err != nil {
+					t.Errorf("Watch error: %v", err)
+				}
+			}
+		}(g)
+	}
+	wg.Wait()
 }

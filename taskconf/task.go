@@ -1,7 +1,6 @@
 package taskconf
 
-type Task interface {
-	//NewTask() *Task
+type task interface {
 	StartTask() bool
 	StopTask() bool
 	AddTask() error

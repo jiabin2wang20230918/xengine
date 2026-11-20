@@ -2,72 +2,70 @@ package compare
 
 import (
 	"encoding/json"
-	"reflect"
 	"testing"
 )
 
-func TestCom(t *testing.T) {
-	t.Log(PropertyMatch(1, 2, "<"))
-	t.Log(PropertyMatch(1, 2, "<="))
-	t.Log(!PropertyMatch(1, 2, ">"))
-	t.Log(!PropertyMatch(1, 2, ">="))
-	t.Log(!PropertyMatch(1, 2, "=="))
-	t.Log(PropertyMatch(1, 2, "!="))
-	t.Log(PropertyMatch(2, 2, "=="))
-	t.Log(PropertyMatch(1.1, 2.2, "<"))
-	t.Log(PropertyMatch(1.1, 2.2, "<="))
-	t.Log(!PropertyMatch(1.1, 2.2, ">"))
-	t.Log(!PropertyMatch(1.1, 2.2, ">="))
-	t.Log(!PropertyMatch(1.1, 2.2, "=="))
-	t.Log(PropertyMatch(1.1, 2.2, "!="))
-	t.Log(PropertyMatch(2.2, 2.2, "=="))
-	t.Log(PropertyMatch("1671688678770", "1671688778770", "<"))
-	t.Log(PropertyMatch("1671688678770", "1671688778770", "<="))
-	t.Log(!PropertyMatch("1671688678770", "1671688778770", ">"))
-	t.Log(!PropertyMatch("1671688678770", "1671688778770", ">="))
-	t.Log(!PropertyMatch("1671688678770", "1671688778770", "=="))
-	t.Log(PropertyMatch("1671688678770", "1671688778770", "!="))
-	t.Log(PropertyMatch("1671688778770", "1671688778770", "=="))
-	t.Log(PropertyMatch("abc", "abc", "=="))
-	t.Log(PropertyMatch("qqqabceeee", "abc", "like"))
-	//t.Log(PropertyMatch(5, `1:5`, "between"))
-	//t.Log(PropertyMatch("5", `"1":"5"`, "between"))
-	//t.Log(PropertyMatch(4, "[1, 2, 4]", "in"))
-	//t.Log(PropertyMatch(3, "[1, 2, 4]", "not in"))
-	//t.Log(PropertyMatch("main", `["default", "case", "main"]`, "in"))
+func TestPropertyMatchOperators(t *testing.T) {
+	tests := []struct {
+		name   string
+		val    interface{}
+		target interface{}
+		symbol string
+		want   bool
+	}{
+		{"int <", 1, 2, "<", true},
+		{"int <=", 1, 2, "<=", true},
+		{"int > false", 1, 2, ">", false},
+		{"int >= false", 1, 2, ">=", false},
+		{"int == false", 1, 2, "==", false},
+		{"int !=", 1, 2, "!=", true},
+		{"int == true", 2, 2, "==", true},
+		{"float <", 1.1, 2.2, "<", true},
+		{"float ==", 2.2, 2.2, "==", true},
+		{"string <", "1671688678770", "1671688778770", "<", true},
+		{"string ==", "abc", "abc", "==", true},
+		{"like match", "qqqabceeee", "abc", "like", true},
+		{"like mismatch", "qqqeeee", "abc", "like", false},
+		{"between match", 5, []interface{}{1, 7}, "between", true},
+		{"between out of range", 9, []interface{}{1, 7}, "between", false},
+		{"between wrong length", 5, []interface{}{1}, "between", false},
+		{"between wrong type", 5, "1:7", "between", false},
+		{"in match", 2, []interface{}{1, 2, 4}, "in", true},
+		{"in mismatch", 3, []interface{}{1, 2, 4}, "in", false},
+		{"not in match", 3, []interface{}{1, 2, 4}, "not in", true},
+		{"not in mismatch", 2, []interface{}{1, 2, 4}, "not in", false},
+		{"unsupported symbol", 1, 1, "===", false},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := PropertyMatch(tc.val, tc.target, tc.symbol); got != tc.want {
+				t.Fatalf("PropertyMatch(%v, %v, %q) = %v, want %v", tc.val, tc.target, tc.symbol, got, tc.want)
+			}
+		})
+	}
 }
 
-func TestName(t *testing.T) {
-	j := []byte(`{ "onOff": 1, "svalue": ["1", "7"], "ivalue": [1, 7]}`)
-	type Temp struct {
-		OnOff  interface{} `json:"onOff"`
+func TestPropertyMatchJSONDecodedTargets(t *testing.T) {
+	raw := []byte(`{"svalue": ["1", "7"], "ivalue": [1, 7]}`)
+	var decoded struct {
 		SValue interface{} `json:"svalue"`
 		IValue interface{} `json:"ivalue"`
 	}
-	temp := &Temp{}
-	err := json.Unmarshal(j, temp)
-	if err != nil {
-		t.Logf("err:%v", err)
-		return
+	if err := json.Unmarshal(raw, &decoded); err != nil {
+		t.Fatalf("unmarshal: %v", err)
 	}
 
-	t.Log(temp.OnOff)
-	t.Log(temp.SValue)
-	t.Log(temp.IValue)
-
-	sv1, ok := temp.SValue.([]interface{})
-	if ok {
-		t.Log(sv1)
-		t.Log(reflect.TypeOf(sv1[0]))
+	if !PropertyMatch(float64(5), decoded.IValue, "between") {
+		t.Fatal("expected 5 between [1, 7]")
 	}
-	sv2, ok := temp.IValue.([]interface{})
-	if ok {
-		t.Log(sv2)
-		t.Log(reflect.TypeOf(sv2[0]))
+	if !PropertyMatch("5", decoded.SValue, "between") {
+		t.Fatal("expected \"5\" between [\"1\", \"7\"]")
 	}
-
-	t.Log(PropertyMatch(5, temp.IValue, "between"))
-	t.Log(PropertyMatch("5", temp.SValue, "between"))
-	t.Log(PropertyMatch(1, temp.IValue, "in"))
-	t.Log(PropertyMatch("7", temp.SValue, "in"))
+	if !PropertyMatch(float64(1), decoded.IValue, "in") {
+		t.Fatal("expected 1 in [1, 7]")
+	}
+	if !PropertyMatch("7", decoded.SValue, "in") {
+		t.Fatal("expected \"7\" in [\"1\", \"7\"]")
+	}
 }

@@ -1,43 +1,30 @@
 package scene
 
 import (
-	"github.com/jiabin2wang20230918/xengine/compare"
-	"github.com/jiabin2wang20230918/xengine/shadow"
-	"github.com/jiabin2wang20230918/xengine/utils/log"
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/jiabin2wang20230918/xengine/compare"
+	"github.com/jiabin2wang20230918/xengine/shadow"
+	"github.com/jiabin2wang20230918/xengine/utils/log"
 )
 
-// Condition 条件需要实现自校验功能
-type Condition interface {
-	// IsMatch 检查自己是否匹配
-	IsMatch() bool
-}
-
-// PropertyCondition 属性条件，提供属性相关检测功能
-type PropertyCondition struct {
-	// deviceId 设备id
-	deviceId string
-	// propertyName 属性名称
-	propertyName string
-	// propertyValue 属性值
+type propertyCondition struct {
+	deviceId      string
+	propertyName  string
 	propertyValue interface{}
-	// symbol 符号 例如 ==,>=
-	symbol string
+	symbol        string
 }
 
-// Match 主动和别的值进行对比是否匹配，可以用于trigger
-func (p *PropertyCondition) Match(propertyName string, propertyValue interface{}) bool {
-	if p.propertyName == propertyName {
-		return compare.PropertyMatch(propertyValue, p.propertyValue, p.symbol)
-	} else {
+func (p *propertyCondition) match(propertyName string, propertyValue interface{}) bool {
+	if p.propertyName != propertyName {
 		return false
 	}
+	return compare.PropertyMatch(propertyValue, p.propertyValue, p.symbol)
 }
 
-// IsMatch 自检测条件是否匹配，基于 shadow 模块检测。
-func (p PropertyCondition) IsMatch() bool {
+func (p *propertyCondition) isMatch() bool {
 	v, ok := shadow.GetPropertyShadow(p.deviceId, p.propertyName)
 	if !ok {
 		return false
@@ -45,83 +32,91 @@ func (p PropertyCondition) IsMatch() bool {
 	return compare.PropertyMatch(v, p.propertyValue, p.symbol)
 }
 
-// EventCondition 事件条件，提供事件相关检测功能
-type EventCondition struct {
+type eventCondition struct {
 	eventName string
 }
 
-// Match 主动检测是否匹配，可以用于trigger
-func (p *EventCondition) Match(eventName string) bool {
+func (p *eventCondition) match(eventName string) bool {
 	return p.eventName == eventName
 }
 
-// TimeCondition 时间条件，负责对时间条件进行响应。
-type TimeCondition struct {
+type timeCondition struct {
 	startTime string
 	endTime   string
 	time      string
 }
 
-// IsMatch
-// 时间条件 是否匹配，自检测是否匹配
-func (c *TimeCondition) IsMatch() bool {
-	// 检查起止时间
-	if c.startEndTimeMatch(time.Now()) {
-		// 检查cron
-		return cronMatchNow(c.time)
-	} else {
-		return false
-	}
+func (c *timeCondition) isMatch() bool {
+	return c.isMatchAt(time.Now())
 }
 
-// startEndTimeMatch 对比起始时间是否匹配
-// 任何异常（格式异常，类型异常）都会返回false
-// 08:59 09:01 --> 09:00 true
-func (c *TimeCondition) startEndTimeMatch(compareTime time.Time) bool {
-	startTime := strings.Split(c.startTime, ":")
-	endTime := strings.Split(c.endTime, ":")
-	if len(startTime) < 2 {
-		log.Errorf("startTime(%s) length not legal", c.startTime)
+func (c *timeCondition) isMatchAt(now time.Time) bool {
+	if !c.startEndTimeMatch(now) {
 		return false
 	}
-	if len(endTime) < 2 {
-		log.Errorf("endTime(%s) length not legal", c.endTime)
-		return false
-	}
-	startTimeHour, err := strconv.ParseInt(startTime[0], 10, 32)
-	if err != nil {
-		log.Errorf("startTimeHour(%s) parse int error:%v", startTime[0], err)
-		return false
-	}
-	startTimeMinute, err := strconv.ParseInt(startTime[1], 10, 32)
-	if err != nil {
-		log.Errorf("startTimeMinute(%s) parse int error:%v", startTime[1], err)
-		return false
-	}
-	endTimeHour, err := strconv.ParseInt(endTime[0], 10, 32)
-	if err != nil {
-		log.Errorf("endTimeHour(%s) parse int error:%v", endTime[0], err)
-		return false
-	}
-	endTimeMinute, err := strconv.ParseInt(endTime[1], 10, 32)
-	if err != nil {
-		log.Errorf("endTimeMinute(%s) parse int error:%v", endTime[1], err)
-		return false
-	}
-	log.Debugf("startTimeHour:%d, startTimeMinute:%d, endTimeHour:%d, endTimeMinute:%d, timeNowHour:%d, timeNowMinute:%d", startTimeHour, startTimeMinute, endTimeHour, endTimeMinute, compareTime.Hour(), compareTime.Minute())
-
-	// start时间判定，要么现在的小时大于起始时间，要么现在的小时等于起始时间同时当前分钟大于起始分钟。
-	startFlag := int(startTimeHour) < compareTime.Hour() || (int(startTimeHour) == compareTime.Hour() && int(startTimeMinute) <= compareTime.Minute())
-	endFlag := int(endTimeHour) > compareTime.Hour() || (int(endTimeHour) == compareTime.Hour() && int(endTimeMinute) >= compareTime.Minute())
-
-	return startFlag && endFlag
+	return cronMatchTime(c.time, now)
 }
 
-// cronMatchNow cron匹配
-// 目前仅匹配了日，月，周，年。
-// 基于 cronMatchSymbol 方法。
-func cronMatchNow(cronData string) bool {
-	split := strings.Split(cronData, " ")
+func parseHourMinute(raw string) (int, int, bool) {
+	parts := strings.Split(raw, ":")
+	if len(parts) != 2 {
+		return 0, 0, false
+	}
+	hour, err := strconv.Atoi(strings.TrimSpace(parts[0]))
+	if err != nil || hour < 0 || hour > 23 {
+		return 0, 0, false
+	}
+	minute, err := strconv.Atoi(strings.TrimSpace(parts[1]))
+	if err != nil || minute < 0 || minute > 59 {
+		return 0, 0, false
+	}
+	return hour, minute, true
+}
+
+// startEndTimeMatch checks whether compareTime's HH:MM falls inside [startTime, endTime].
+// Supports both daytime windows (e.g. 08:59-09:01) and overnight windows (e.g. 22:00-06:00).
+func (c *timeCondition) startEndTimeMatch(compareTime time.Time) bool {
+	startHour, startMinute, ok := parseHourMinute(c.startTime)
+	if !ok {
+		log.Errorf("startTime(%s) is invalid", c.startTime)
+		return false
+	}
+	endHour, endMinute, ok := parseHourMinute(c.endTime)
+	if !ok {
+		log.Errorf("endTime(%s) is invalid", c.endTime)
+		return false
+	}
+
+	startTotal := startHour*60 + startMinute
+	endTotal := endHour*60 + endMinute
+	nowTotal := compareTime.Hour()*60 + compareTime.Minute()
+
+	log.Debugf("startTime=%02d:%02d endTime=%02d:%02d now=%02d:%02d",
+		startHour, startMinute, endHour, endMinute, compareTime.Hour(), compareTime.Minute())
+
+	if startTotal <= endTotal {
+		return nowTotal >= startTotal && nowTotal <= endTotal
+	}
+	// Overnight window wraps across midnight.
+	return nowTotal >= startTotal || nowTotal <= endTotal
+}
+
+var (
+	monthAliases = map[string]int{
+		"JAN": 1, "FEB": 2, "MAR": 3, "APR": 4,
+		"MAY": 5, "JUN": 6, "JUL": 7, "AUG": 8,
+		"SEP": 9, "OCT": 10, "NOV": 11, "DEC": 12,
+	}
+	// Cloud protocol weekday numbering: 1=SUN .. 7=SAT.
+	weekdayAliases = map[string]int{
+		"SUN": 1, "MON": 2, "TUE": 3, "WED": 4,
+		"THU": 5, "FRI": 6, "SAT": 7,
+	}
+)
+
+// cronMatchTime checks day, month, weekday (1=SUN..7=SAT), and year fields of a 7-field cron string.
+func cronMatchTime(cronData string, now time.Time) bool {
+	split := strings.Fields(cronData)
 	if len(split) < 7 {
 		log.Errorf("cron data(%s) length err", cronData)
 		return false
@@ -132,35 +127,87 @@ func cronMatchNow(cronData string) bool {
 	weekString := split[5]
 	yearString := split[6]
 
-	timeNow := time.Now()
-
-	// 注意当前day of week需+1才和云端协议匹配
-	return cronMatchSymbol(timeNow.Day(), dayString) && cronMatchSymbol(int(timeNow.Month()), monthString) && cronMatchSymbol(int(timeNow.Weekday())+1, weekString) && cronMatchSymbol(timeNow.Year(), yearString)
+	return cronMatchField(now.Day(), dayString, 1, 31, nil) &&
+		cronMatchField(int(now.Month()), monthString, 1, 12, monthAliases) &&
+		cronMatchField(int(now.Weekday())+1, weekString, 1, 7, weekdayAliases) &&
+		cronMatchField(now.Year(), yearString, 1970, 2099, nil)
 }
 
-// cronMatchSymbol cron符号匹配
-// 符号支持 '?' '*' 'number, number'
-func cronMatchSymbol(value int, cronSingle string) bool {
-	switch cronSingle {
-	case "?":
-		return true
-	case "*":
-		return true
-	default:
-		d := strings.Split(cronSingle, ",")
-		for _, s := range d {
-			parseInt, err := strconv.ParseInt(s, 10, 32)
-			if err != nil {
-				log.Errorf("cron data(%s) string parse int err:%v", s, err)
-				return false
-			}
-			if value == int(parseInt) {
-				// day not match
-				log.Debugf("one of cron filed data(%d) match value(%d)", parseInt, value)
-				return true
-			}
+func parseCronToken(token string, aliases map[string]int) (int, bool) {
+	t := strings.TrimSpace(token)
+	if t == "" {
+		return 0, false
+	}
+	if aliases != nil {
+		if v, ok := aliases[strings.ToUpper(t)]; ok {
+			return v, true
 		}
-		log.Debugf("cron filed(%v) not match value(%d)", d, value)
+	}
+	v, err := strconv.Atoi(t)
+	if err != nil {
+		return 0, false
+	}
+	return v, true
+}
+
+// cronMatchField matches a single cron field supporting '?', '*', lists (a,b), ranges (a-b), and steps (*/n, a-b/n, a/n).
+func cronMatchField(value int, field string, minVal, maxVal int, aliases map[string]int) bool {
+	field = strings.TrimSpace(field)
+	if field == "?" || field == "*" {
+		return true
+	}
+
+	for _, part := range strings.Split(field, ",") {
+		part = strings.TrimSpace(part)
+		if part == "" {
+			continue
+		}
+		if matchCronPart(value, part, minVal, maxVal, aliases) {
+			return true
+		}
+	}
+	log.Debugf("cron field(%s) does not match value(%d)", field, value)
+	return false
+}
+
+func matchCronPart(value int, part string, minVal, maxVal int, aliases map[string]int) bool {
+	step := 1
+	base := part
+	hasStep := false
+
+	if idx := strings.IndexByte(part, '/'); idx >= 0 {
+		base = part[:idx]
+		stepStr := part[idx+1:]
+		s, err := strconv.Atoi(strings.TrimSpace(stepStr))
+		if err != nil || s <= 0 {
+			log.Errorf("cron step(%s) invalid", part)
+			return false
+		}
+		step = s
+		hasStep = true
+	}
+
+	if base == "*" || base == "?" {
+		return value >= minVal && value <= maxVal && (value-minVal)%step == 0
+	}
+
+	if idx := strings.IndexByte(base, '-'); idx >= 0 {
+		start, ok1 := parseCronToken(base[:idx], aliases)
+		end, ok2 := parseCronToken(base[idx+1:], aliases)
+		if !ok1 || !ok2 || start > end {
+			log.Errorf("cron range(%s) invalid", part)
+			return false
+		}
+		return value >= start && value <= end && (value-start)%step == 0
+	}
+
+	start, ok := parseCronToken(base, aliases)
+	if !ok {
+		log.Errorf("cron token(%s) invalid", part)
 		return false
 	}
+	if hasStep {
+		return value >= start && value <= maxVal && (value-start)%step == 0
+	}
+	return value == start
 }

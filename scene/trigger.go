@@ -1,5 +1,5 @@
 package scene
 
-type TickerTrigger struct {
-	CronString string
+type tickerTrigger struct {
+	cronString string
 }

@@ -1,36 +1,49 @@
-// Package shadow 是影子模块，用于更新和获取缓存。
-//
-// 目前支持属性缓存与获取
+// Package shadow maintains an in-memory property cache for devices.
 package shadow
 
-type DeviceShadow struct {
-	// PropertyShadow key 为属性名称 value位属性值
-	PropertyShadow map[string]interface{}
+import "sync"
+
+type deviceShadow struct {
+	propertyShadow map[string]interface{}
 }
 
-// DevicesShadow key为deviceId
-var DevicesShadow = make(map[string]*DeviceShadow)
+var (
+	mu            sync.RWMutex
+	devicesShadow = make(map[string]*deviceShadow)
+)
 
-// UpdatePropertyShadow 更新属性的影子值
+// UpdatePropertyShadow stores or overwrites the cached value for a device property.
 func UpdatePropertyShadow(deviceId string, propertyName string, propertyValue interface{}) {
-	shadow, ok := DevicesShadow[deviceId]
+	mu.Lock()
+	defer mu.Unlock()
+
+	s, ok := devicesShadow[deviceId]
 	if !ok {
-		shadow = &DeviceShadow{PropertyShadow: make(map[string]interface{})}
-		DevicesShadow[deviceId] = shadow
+		s = &deviceShadow{propertyShadow: make(map[string]interface{})}
+		devicesShadow[deviceId] = s
 	}
-	shadow.PropertyShadow[propertyName] = propertyValue
+	s.propertyShadow[propertyName] = propertyValue
 }
 
-// GetPropertyShadow 获取属性的影子值
-// 返回：值，是否有缓存
+// GetPropertyShadow returns the cached property value and whether it exists.
 func GetPropertyShadow(deviceId string, propertyName string) (interface{}, bool) {
-	c, ok := DevicesShadow[deviceId]
+	mu.RLock()
+	defer mu.RUnlock()
+
+	c, ok := devicesShadow[deviceId]
 	if !ok {
 		return nil, false
 	}
-	v, ok := c.PropertyShadow[propertyName]
+	v, ok := c.propertyShadow[propertyName]
 	if !ok {
 		return nil, false
 	}
 	return v, true
+}
+
+// reset clears all cached shadows. Intended for tests.
+func reset() {
+	mu.Lock()
+	defer mu.Unlock()
+	devicesShadow = make(map[string]*deviceShadow)
 }

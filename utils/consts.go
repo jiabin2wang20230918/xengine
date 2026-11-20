@@ -2,7 +2,7 @@ package utils
 
 const (
 
-	// SceneActionRecallOperation 别的模块请求recall的operation
+	// SceneActionRecallOperation is the beehive operation used to request a scene recall.
 	SceneActionRecallOperation = "recall"
 )
 
