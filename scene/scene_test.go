@@ -79,8 +79,9 @@ func TestAddScene(t *testing.T) {
 		t.Errorf("err:%v", err)
 		return
 	}
-	for id, scene := range defaultCacheScene {
-		t.Logf("id:%v scene:%v,%v,%v,%v,%v", id, len(scene.TimeConditions), len(scene.PropertyConditions), len(scene.PropertyTriggers), len(scene.EventTriggers), len(scene.TickerTriggers))
+	t.Cleanup(func() { RemoveScene(p.Id) })
+	for _, scene := range snapshotScenes() {
+		t.Logf("id:%v scene:%v,%v,%v,%v,%v", scene.Id, len(scene.TimeConditions), len(scene.PropertyConditions), len(scene.PropertyTriggers), len(scene.EventTriggers), len(scene.TickerTriggers))
 	}
 }
 

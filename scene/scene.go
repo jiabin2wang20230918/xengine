@@ -21,12 +21,16 @@ package scene
 import (
 	"encoding/json"
 	"fmt"
+	"strings"
+	"sync"
+	"sync/atomic"
+
 	beehiveContext "github.com/kubeedge/beehive/pkg/core/context"
 	"github.com/robfig/cron/v3"
+
 	"github.com/jiabin2wang20230918/xengine/utils"
 	"github.com/jiabin2wang20230918/xengine/utils/log"
 	"github.com/jiabin2wang20230918/xengine/utils/message"
-	"strings"
 )
 
 // Scene scene模块一个场景的基础单位，缓存要关心的 triggers 和 conditions
@@ -55,8 +59,38 @@ type Scene struct {
 	ActionNotifyModuleName string
 }
 
-// defaultCacheScene 场景缓存，key sceneId
-var defaultCacheScene = make(map[uint16]*Scene)
+// sceneCache holds active scenes. All access must go through the mutex.
+type sceneCache struct {
+	mu     sync.RWMutex
+	scenes map[uint16]*Scene
+}
+
+var defaultCacheScene = sceneCache{
+	scenes: make(map[uint16]*Scene),
+}
+
+// actionNotify delivers a matched scene action. Tests may override via setActionNotify.
+var actionNotify atomic.Value // holds func(string, uint16)
+
+func init() {
+	actionNotify.Store(defaultActionNotify)
+}
+
+func defaultActionNotify(moduleName string, sceneId uint16) {
+	beehiveContext.Send(moduleName, *message.BuildMsg("", "", "scene", "", utils.SceneActionRecallOperation, sceneId))
+}
+
+func setActionNotify(fn func(string, uint16)) {
+	if fn == nil {
+		actionNotify.Store(defaultActionNotify)
+		return
+	}
+	actionNotify.Store(fn)
+}
+
+func getActionNotify() func(string, uint16) {
+	return actionNotify.Load().(func(string, uint16))
+}
 
 // SceneParams 场景的参数
 type SceneParams struct {
@@ -70,6 +104,9 @@ type SceneParams struct {
 // scene模块的id不关联业务信息（是云端sceneId还是南向的sceneId都不关心），只是用作key存储和通知别的模块执行此id的场景。
 // ActionNotifyModuleName 参数用于指向场景满足时发向的模块名称。
 // Triggers/Conditions 和云端协议保持一致的原始json数据。
+//
+// Replacing an existing scene ID stops the previous cron/ticker before the new
+// scene's timers start, so timers cannot double-fire after overwrite.
 func AddScene(params *SceneParams) error {
 
 	s := &Scene{
@@ -91,7 +128,16 @@ func AddScene(params *SceneParams) error {
 		return err
 	}
 
-	defaultCacheScene[params.Id] = s
+	defaultCacheScene.mu.Lock()
+	old := defaultCacheScene.scenes[params.Id]
+	defaultCacheScene.scenes[params.Id] = s
+	defaultCacheScene.mu.Unlock()
+
+	// Stop the previous timer outside the write lock so a running job cannot
+	// deadlock against cache readers; Stop itself does not wait for jobs.
+	if old != nil && old.corn != nil {
+		old.corn.Stop()
+	}
 
 	s.tickerTriggerStart()
 	return nil
@@ -99,19 +145,32 @@ func AddScene(params *SceneParams) error {
 
 // RemoveScene 移除场景监控
 func RemoveScene(id uint16) {
-	s, ok := defaultCacheScene[id]
+	defaultCacheScene.mu.Lock()
+	s, ok := defaultCacheScene.scenes[id]
 	if ok {
-		if s.corn != nil {
-			s.corn.Stop()
-		}
-		delete(defaultCacheScene, id)
+		delete(defaultCacheScene.scenes, id)
 	}
+	defaultCacheScene.mu.Unlock()
+	if ok && s.corn != nil {
+		s.corn.Stop()
+	}
+}
+
+// snapshotScenes returns a stable slice of scenes for lock-free iteration by callers.
+func snapshotScenes() []*Scene {
+	defaultCacheScene.mu.RLock()
+	defer defaultCacheScene.mu.RUnlock()
+	out := make([]*Scene, 0, len(defaultCacheScene.scenes))
+	for _, scene := range defaultCacheScene.scenes {
+		out = append(out, scene)
+	}
+	return out
 }
 
 // PropertyTriggerCheck 属性触发器检查
 // 检查所有场景是否触发
 func PropertyTriggerCheck(deviceId string, propertyName string, propertyValue interface{}) {
-	for _, scene := range defaultCacheScene {
+	for _, scene := range snapshotScenes() {
 		scene.PropertyTriggerCheck(deviceId, propertyName, propertyValue)
 	}
 }
@@ -119,7 +178,7 @@ func PropertyTriggerCheck(deviceId string, propertyName string, propertyValue in
 // EventTriggerCheck 事件触发器检查
 // 检查所有场景是否触发
 func EventTriggerCheck(deviceId string, eventName string) {
-	for _, scene := range defaultCacheScene {
+	for _, scene := range snapshotScenes() {
 		scene.EventTriggerCheck(deviceId, eventName)
 	}
 }
@@ -204,7 +263,7 @@ func (s *Scene) allConditionMatch() bool {
 // 本模块的action负责将要执行的 id 发送指定模块。
 func (s *Scene) action() {
 	log.Infof("will execute scene id:%v", s.Id)
-	beehiveContext.Send(s.ActionNotifyModuleName, *message.BuildMsg("", "", "scene", "", utils.SceneActionRecallOperation, s.Id))
+	getActionNotify()(s.ActionNotifyModuleName, s.Id)
 }
 
 // initConditions 初始化条件相关信息，加载信息到缓存中。

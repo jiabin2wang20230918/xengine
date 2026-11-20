@@ -1,6 +1,11 @@
 package log
 
-var ilog *InnerLog
+import "sync"
+
+var (
+	ilogMu sync.RWMutex
+	ilog   *InnerLog
+)
 
 type InnerLog struct {
 	Infof  func(template string, args ...interface{})
@@ -10,6 +15,8 @@ type InnerLog struct {
 }
 
 func InitInnerLog(i *InnerLog) {
+	ilogMu.Lock()
+	defer ilogMu.Unlock()
 	ilog = &InnerLog{
 		Infof:  i.Infof,
 		Debugf: i.Debugf,
@@ -19,25 +26,37 @@ func InitInnerLog(i *InnerLog) {
 }
 
 func Infof(template string, args ...interface{}) {
-	if ilog != nil && ilog.Infof != nil {
-		ilog.Infof(template, args...)
+	ilogMu.RLock()
+	l := ilog
+	ilogMu.RUnlock()
+	if l != nil && l.Infof != nil {
+		l.Infof(template, args...)
 	}
 }
 
 func Debugf(template string, args ...interface{}) {
-	if ilog != nil && ilog.Debugf != nil {
-		ilog.Debugf(template, args...)
+	ilogMu.RLock()
+	l := ilog
+	ilogMu.RUnlock()
+	if l != nil && l.Debugf != nil {
+		l.Debugf(template, args...)
 	}
 }
 
 func Warnf(template string, args ...interface{}) {
-	if ilog != nil && ilog.Warnf != nil {
-		ilog.Warnf(template, args...)
+	ilogMu.RLock()
+	l := ilog
+	ilogMu.RUnlock()
+	if l != nil && l.Warnf != nil {
+		l.Warnf(template, args...)
 	}
 }
 
 func Errorf(template string, args ...interface{}) {
-	if ilog != nil && ilog.Errorf != nil {
-		ilog.Errorf(template, args...)
+	ilogMu.RLock()
+	l := ilog
+	ilogMu.RUnlock()
+	if l != nil && l.Errorf != nil {
+		l.Errorf(template, args...)
 	}
 }
