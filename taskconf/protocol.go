@@ -3,6 +3,7 @@ package taskconf
 import (
 	"encoding/json"
 	"fmt"
+
 	"github.com/jiabin2wang20230918/xengine/utils/log"
 )
 
@@ -11,7 +12,7 @@ const (
 	ErrorCodeFail    = 400
 )
 
-type MsgInfo struct {
+type msgInfo struct {
 	Id         string
 	DeviceId   string
 	ProductKey string
@@ -38,15 +39,17 @@ type notifyPayload struct {
 
 func parseTaskParams(payload []byte) *notifyPayload {
 	p := &notifyPayload{}
-	err := json.Unmarshal(payload, &p)
-	if err != nil {
+	if err := json.Unmarshal(payload, &p); err != nil {
 		log.Errorf("%v", err)
 		return nil
 	}
 	return p
 }
 
-func notifyRespond(dev *MsgInfo, errCode int, fn WriteToNorth) {
+func notifyRespond(dev *msgInfo, errCode int, fn WriteToNorth) {
+	if dev == nil || fn == nil {
+		return
+	}
 	respond := &struct {
 		Id   string `json:"id"`
 		Code int    `json:"code"`
@@ -58,9 +61,13 @@ func notifyRespond(dev *MsgInfo, errCode int, fn WriteToNorth) {
 	}
 
 	resource := fmt.Sprintf("/sys/%s/%s/thing/edge/notify_reply", dev.ProductKey, dev.DeviceId)
-	content, _ := json.Marshal(respond)
-	if &fn != nil {
-		_ = fn(resource, content)
+	content, err := json.Marshal(respond)
+	if err != nil {
+		log.Errorf("marshal notifyRespond failed: %v", err)
+		return
+	}
+	if err := fn(resource, content); err != nil {
+		log.Errorf("publish notifyRespond failed: %v", err)
 	}
 }
 
@@ -81,8 +88,7 @@ type sceneReply struct {
 
 func parseScenesData(payload []byte) *sceneReply {
 	reply := &sceneReply{}
-	err := json.Unmarshal(payload, &reply)
-	if err != nil {
+	if err := json.Unmarshal(payload, &reply); err != nil {
 		log.Errorf("%v", err)
 		return nil
 	}

@@ -2,92 +2,97 @@ package taskconf
 
 import (
 	"crypto/md5"
+
 	"github.com/jiabin2wang20230918/xengine/linkage"
 	"github.com/jiabin2wang20230918/xengine/scene"
 	"github.com/jiabin2wang20230918/xengine/utils/log"
 )
 
-type LinkTask struct {
+type linkTask struct {
 	sceneConfig *linkage.SceneConfig
 	linkRule    *linkage.Rule
 }
 
-func NewLinkTask(ruleId string, data *taskData, fn *linkage.WriteToSouth) *LinkTask {
-	t := &LinkTask{
-		sceneConfig: &linkage.SceneConfig{PublishToDevice: *fn},
-		linkRule: &linkage.Rule{
-			SceneId:    linkage.GenerateSceneId(),
-			RuleId:     ruleId,
-			Enable:     true,
-			Triggers:   data.Triggers,
-			Conditions: data.Conditions,
-			Actions:    data.Actions,
-		},
+var _ task = (*linkTask)(nil)
+
+func newLinkTask(ruleId string, data *taskData, fn *linkage.WriteToSouth) *linkTask {
+	var publish linkage.WriteToSouth
+	if fn != nil {
+		publish = *fn
 	}
-	return t
+	rule := &linkage.Rule{
+		RuleId: ruleId,
+		Enable: true,
+	}
+	if data != nil {
+		rule.Triggers = data.Triggers
+		rule.Conditions = data.Conditions
+		rule.Actions = data.Actions
+	}
+	return &linkTask{
+		sceneConfig: &linkage.SceneConfig{PublishToDevice: publish},
+		linkRule:    rule,
+	}
 }
 
-func (t *LinkTask) StartTask() bool {
+func (t *linkTask) StartTask() bool {
 	s := &scene.SceneParams{
 		Id:                     t.linkRule.SceneId,
 		Conditions:             t.linkRule.Conditions,
 		Triggers:               t.linkRule.Triggers,
 		ActionNotifyModuleName: TaskManagerName,
 	}
-	err := scene.AddScene(s)
-	if err != nil {
+	if err := scene.AddScene(s); err != nil {
 		log.Errorf("%v", err)
 		return false
 	}
 	return true
 }
 
-func (t *LinkTask) StopTask() bool {
+func (t *linkTask) StopTask() bool {
 	scene.RemoveScene(t.linkRule.SceneId)
 	return true
 }
 
-func (t *LinkTask) AddTask() error {
-	err := t.linkRule.SetRule()
-	if err != nil {
+func (t *linkTask) AddTask() error {
+	if err := t.linkRule.SetRule(); err != nil {
 		log.Errorf("%v", err)
 		return err
 	}
-	err = t.sceneConfig.ConfigScene(t.linkRule)
-	if err != nil {
-		t.linkRule.DeleteRule()
+	if err := t.sceneConfig.ConfigScene(t.linkRule); err != nil {
+		if delErr := t.linkRule.DeleteRule(); delErr != nil {
+			log.Errorf("rollback DeleteRule(%s) failed: %v", t.linkRule.RuleId, delErr)
+		}
+		return err
 	}
-	return err
+	return nil
 }
 
-func (t *LinkTask) SyncTask(newTask *taskData) error {
+func (t *linkTask) SyncTask(newTask *taskData) error {
 	oldMd5 := md5.Sum(t.linkRule.Actions)
 	newMd5 := md5.Sum(newTask.Actions)
 
-	if oldMd5 != newMd5 { // actions change, need to delete and add again
-		err := t.DeleteTask()
-		if err != nil {
+	if oldMd5 != newMd5 {
+		if err := t.DeleteTask(); err != nil {
 			return err
 		}
+		// Reset SceneId so AddTask allocates or recycles a valid ID.
+		t.linkRule.SceneId = 0
 		t.linkRule.Triggers = newTask.Triggers
 		t.linkRule.Conditions = newTask.Conditions
 		t.linkRule.Actions = newTask.Actions
-		err = t.AddTask()
-		return err
+		return t.AddTask()
 	}
-	//just update database here
+
 	t.linkRule.Triggers = newTask.Triggers
 	t.linkRule.Conditions = newTask.Conditions
 	t.linkRule.Actions = newTask.Actions
-	err := t.linkRule.SetRule()
-	return err
+	return t.linkRule.SetRule()
 }
 
-func (t *LinkTask) DeleteTask() error {
-	err := t.sceneConfig.RemoveScene(t.linkRule)
-	if err != nil {
+func (t *linkTask) DeleteTask() error {
+	if err := t.sceneConfig.RemoveScene(t.linkRule); err != nil {
 		return err
 	}
-	err = t.linkRule.DeleteRule()
-	return err
+	return t.linkRule.DeleteRule()
 }

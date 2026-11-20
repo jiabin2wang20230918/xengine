@@ -3,15 +3,17 @@ package taskconf
 import (
 	"encoding/json"
 	"fmt"
-	"github.com/jinzhu/gorm"
+	"strings"
+	"sync"
+
 	"github.com/kubeedge/beehive/pkg/core"
 	beehiveContext "github.com/kubeedge/beehive/pkg/core/context"
+	"gorm.io/gorm"
+
 	"github.com/jiabin2wang20230918/xengine/linkage"
 	"github.com/jiabin2wang20230918/xengine/utils"
 	"github.com/jiabin2wang20230918/xengine/utils/log"
 	"github.com/jiabin2wang20230918/xengine/watch"
-	"strings"
-	"sync"
 )
 
 type WriteToNorth func(topic string, payload []byte) error
@@ -25,12 +27,18 @@ type TaskManager struct {
 
 func Register(db *gorm.DB, ps *linkage.WriteToSouth, pn *WriteToNorth) {
 	t := &TaskManager{
-		enable:         true,
-		taskList:       sync.Map{},
-		publishToNorth: *pn,
-		publishToSouth: *ps,
+		enable:   true,
+		taskList: sync.Map{},
 	}
-	linkage.InitRuleDb(db)
+	if pn != nil {
+		t.publishToNorth = *pn
+	}
+	if ps != nil {
+		t.publishToSouth = *ps
+	}
+	if err := linkage.InitRuleDb(db); err != nil {
+		log.Errorf("InitRuleDb failed: %v", err)
+	}
 	core.Register(t)
 }
 
@@ -58,7 +66,8 @@ func (t *TaskManager) loadAndRun() {
 	}
 	for _, r := range rules {
 		rule := r
-		link := &LinkTask{linkRule: &rule,
+		link := &linkTask{
+			linkRule:    &rule,
 			sceneConfig: &linkage.SceneConfig{PublishToDevice: t.publishToSouth},
 		}
 		t.taskList.Store(rule.RuleId, link)
@@ -81,13 +90,18 @@ func (t *TaskManager) taskProcess() {
 		beehiveMessage, err := beehiveContext.Receive(t.Name())
 		if err != nil {
 			log.Errorf("receive err:%v", err)
+			select {
+			case <-beehiveContext.Done():
+				return
+			default:
+				continue
+			}
 		}
 		operation := beehiveMessage.GetOperation()
 		topic := beehiveMessage.GetResource()
 
 		switch operation {
 		case "cloudToDeviceMQTTMessage":
-			// notify/get_reply
 			split := strings.Split(topic, "/")
 			switch split[len(split)-1] {
 			case "notify":
@@ -100,23 +114,20 @@ func (t *TaskManager) taskProcess() {
 				payload, ok := beehiveMessage.GetContent().([]byte)
 				if ok {
 					_ = t.parseSceneSync(topic, payload)
-
 				}
 			default:
 				log.Errorf("not supported topic:%s", topic)
 			}
 		case "deviceToCloudMQTTMessage":
-			// event/+/post
 			payload, ok := beehiveMessage.GetContent().([]byte)
 			if ok {
-				err := watch.Watch(topic, payload)
-				if err != nil {
+				if err := watch.Watch(topic, payload); err != nil {
 					log.Errorf("%v", err)
 				}
 			}
 		case utils.SceneActionRecallOperation:
 			sceneId, ok := beehiveMessage.GetContent().(uint16)
-			if &t.publishToSouth != nil && ok {
+			if t.publishToSouth != nil && ok {
 				r, err := linkage.QueryRuleBySceneId(sceneId)
 				if err != nil {
 					log.Errorf("%v", err)
@@ -131,57 +142,56 @@ func (t *TaskManager) taskProcess() {
 					SceneId: sceneId,
 					Actions: r.Actions,
 				}
-				payload, _ := json.Marshal(recall)
-				topic = utils.PublishToDeviceSceneRecallTopic
-				err = t.publishToSouth(topic, payload)
+				payload, err := json.Marshal(recall)
 				if err != nil {
+					log.Errorf("marshal recall failed: %v", err)
+					break
+				}
+				if err := t.publishToSouth(utils.PublishToDeviceSceneRecallTopic, payload); err != nil {
 					log.Errorf("%v", err)
 				}
 			}
 		default:
 			log.Warnf("unexpect beehiveMessage:%v", beehiveMessage)
-
 		}
-
 	}
 }
 
-func (t *TaskManager) parseTaskPayload(topic string, payload []byte) (int, *MsgInfo) {
-	var errCode = ErrorCodeSuccess
-	devInfo := &MsgInfo{}
+func (t *TaskManager) parseTaskPayload(topic string, payload []byte) (int, *msgInfo) {
+	errCode := ErrorCodeSuccess
+	devInfo := &msgInfo{}
 	seps := strings.Split(topic, "/")
-	devInfo.DeviceId = seps[3]
+	if len(seps) < 7 {
+		log.Warnf("unexpect topic=%s", topic)
+		return ErrorCodeFail, devInfo
+	}
 	devInfo.ProductKey = seps[2]
+	devInfo.DeviceId = seps[3]
 
-	if seps[5] == "edge" && seps[6] == "notify" {
-		msg := parseTaskParams(payload)
-		if msg == nil {
-			errCode = ErrorCodeFail
-			return errCode, devInfo
-		}
-		devInfo.Id = msg.Id
+	if seps[5] != "edge" || seps[6] != "notify" {
+		log.Warnf("unexpect topic=%s", topic)
+		return ErrorCodeFail, devInfo
+	}
 
-		task, ok := t.taskList.Load(msg.Params.Id)
-		if !ok && msg.Params.OperateType != "add" {
-			log.Warnf("!! Not found taskId=%s in map", msg.Params.Id)
-			errCode = ErrorCodeFail
-			return errCode, devInfo
-		}
+	msg := parseTaskParams(payload)
+	if msg == nil {
+		return ErrorCodeFail, devInfo
+	}
+	devInfo.Id = msg.Id
 
-		switch msg.Params.OperateType {
-		case "add":
-			link := NewLinkTask(msg.Params.Id, &msg.Params.Data, &t.publishToSouth)
-			link.sceneConfig.MsgId = msg.Id
-			if err := link.AddTask(); err == nil {
-				t.taskList.Store(msg.Params.Id, link)
-				link.StartTask()
-			} else { //fail
-				errCode = ErrorCodeFail
-			}
-		case "update":
-			if link, ok := task.(*LinkTask); ok {
+	existing, ok := t.taskList.Load(msg.Params.Id)
+	if !ok && msg.Params.OperateType != "add" {
+		log.Warnf("Not found taskId=%s in map", msg.Params.Id)
+		return ErrorCodeFail, devInfo
+	}
+
+	switch msg.Params.OperateType {
+	case "add":
+		if ok {
+			// Idempotent add: stop existing scene and sync in place to avoid leaking crons or duplicate rules.
+			if link, valid := existing.(*linkTask); valid {
 				link.StopTask()
-				//如果是修改，需先删除设备端旧数据再新增
+				link.linkRule.Enable = true
 				link.sceneConfig.MsgId = msg.Id
 				if err := link.SyncTask(&msg.Params.Data); err == nil {
 					t.taskList.Store(msg.Params.Id, link)
@@ -191,44 +201,63 @@ func (t *TaskManager) parseTaskPayload(topic string, payload []byte) (int, *MsgI
 					errCode = ErrorCodeFail
 				}
 			}
-		case "delete":
-			if link, ok := task.(*LinkTask); ok {
-				link.StopTask()
-				if err := link.DeleteTask(); err != nil {
-					errCode = ErrorCodeFail
-				}
-				t.taskList.Delete(link.linkRule.RuleId)
-			}
-
-		case "stop":
-			if link, ok := task.(*LinkTask); ok {
-				link.linkRule.Enable = false
-				err := link.linkRule.SetRule() //更新数据库
-				if err != nil {
-					log.Errorf("%v", err)
-					errCode = ErrorCodeFail
-				} else {
-					link.StopTask()
-				}
-			}
-		case "run":
-			if link, ok := task.(*LinkTask); ok {
-				link.linkRule.Enable = true
-				err := link.linkRule.SetRule()
-				if err != nil {
-					log.Errorf("%v", err)
-					errCode = ErrorCodeFail
-				} else {
-					link.StartTask()
-				}
-			}
-		default:
-			log.Warnf("not support operateType=%s", msg.Params.OperateType)
+			break
+		}
+		link := newLinkTask(msg.Params.Id, &msg.Params.Data, &t.publishToSouth)
+		link.sceneConfig.MsgId = msg.Id
+		if err := link.AddTask(); err == nil {
+			t.taskList.Store(msg.Params.Id, link)
+			link.StartTask()
+		} else {
 			errCode = ErrorCodeFail
 		}
-
-	} else {
-		log.Warnf("!! unexpect topic=%s", topic)
+	case "update":
+		if link, valid := existing.(*linkTask); valid {
+			link.StopTask()
+			link.sceneConfig.MsgId = msg.Id
+			if err := link.SyncTask(&msg.Params.Data); err == nil {
+				t.taskList.Store(msg.Params.Id, link)
+				if link.linkRule.Enable {
+					link.StartTask()
+				}
+			} else {
+				log.Errorf("%v", err)
+				errCode = ErrorCodeFail
+			}
+		}
+	case "delete":
+		if link, valid := existing.(*linkTask); valid {
+			link.StopTask()
+			link.sceneConfig.MsgId = msg.Id
+			if err := link.DeleteTask(); err != nil {
+				log.Errorf("%v", err)
+				errCode = ErrorCodeFail
+			} else {
+				t.taskList.Delete(link.linkRule.RuleId)
+			}
+		}
+	case "stop":
+		if link, valid := existing.(*linkTask); valid {
+			link.linkRule.Enable = false
+			if err := link.linkRule.SetRule(); err != nil {
+				log.Errorf("%v", err)
+				errCode = ErrorCodeFail
+			} else {
+				link.StopTask()
+			}
+		}
+	case "run":
+		if link, valid := existing.(*linkTask); valid {
+			link.linkRule.Enable = true
+			if err := link.linkRule.SetRule(); err != nil {
+				log.Errorf("%v", err)
+				errCode = ErrorCodeFail
+			} else {
+				link.StartTask()
+			}
+		}
+	default:
+		log.Warnf("not support operateType=%s", msg.Params.OperateType)
 		errCode = ErrorCodeFail
 	}
 
@@ -236,47 +265,74 @@ func (t *TaskManager) parseTaskPayload(topic string, payload []byte) (int, *MsgI
 }
 
 func (t *TaskManager) parseSceneSync(topic string, payload []byte) int {
-	var errCode = ErrorCodeSuccess
+	errCode := ErrorCodeSuccess
 
 	seps := strings.Split(topic, "/")
-	if seps[5] == "edge" && seps[6] == "get_reply" {
-		msg := parseScenesData(payload)
-		if msg == nil {
-			log.Errorf("parseScenesData fail !!")
-			errCode = ErrorCodeFail
-			return errCode
-		}
+	if len(seps) < 7 || seps[5] != "edge" || seps[6] != "get_reply" {
+		log.Warnf("unexpect topic=%s", topic)
+		return ErrorCodeFail
+	}
 
-		for _, scene := range msg.Data.Scenes {
-			task, ok := t.taskList.Load(scene.Id)
-			if ok {
-				if link, ok := task.(*LinkTask); ok {
-					link.StopTask()
-					link.sceneConfig.MsgId = msg.Id
-					if err := link.SyncTask(&scene.taskData); err == nil {
-						t.taskList.Store(scene.Id, link)
-						link.StartTask()
-					} else {
-						log.Errorf("%v", err)
-						errCode = ErrorCodeFail
-					}
-				}
-			} else {
-				link := NewLinkTask(scene.Id, &scene.taskData, &t.publishToSouth)
+	msg := parseScenesData(payload)
+	if msg == nil {
+		log.Errorf("parseScenesData fail")
+		return ErrorCodeFail
+	}
+
+	remoteIDs := make(map[string]struct{}, len(msg.Data.Scenes))
+	for _, sc := range msg.Data.Scenes {
+		remoteIDs[sc.Id] = struct{}{}
+		existing, ok := t.taskList.Load(sc.Id)
+		if ok {
+			if link, valid := existing.(*linkTask); valid {
+				link.StopTask()
 				link.sceneConfig.MsgId = msg.Id
-				if err := link.AddTask(); err == nil {
-					t.taskList.Store(scene.Id, link)
-					link.StartTask()
-				} else { //fail
+				if err := link.SyncTask(&sc.taskData); err == nil {
+					t.taskList.Store(sc.Id, link)
+					if link.linkRule.Enable {
+						link.StartTask()
+					}
+				} else {
 					log.Errorf("%v", err)
 					errCode = ErrorCodeFail
 				}
 			}
+		} else {
+			link := newLinkTask(sc.Id, &sc.taskData, &t.publishToSouth)
+			link.sceneConfig.MsgId = msg.Id
+			if err := link.AddTask(); err == nil {
+				t.taskList.Store(sc.Id, link)
+				link.StartTask()
+			} else {
+				log.Errorf("%v", err)
+				errCode = ErrorCodeFail
+			}
 		}
-		//Todo here: 删除部分也需要对比处理
-	} else {
-		log.Warnf("!! unexpect topic=%s", topic)
-		errCode = ErrorCodeFail
+	}
+
+	// Remove local scenes that no longer exist in the cloud snapshot.
+	var staleIDs []string
+	t.taskList.Range(func(key, _ interface{}) bool {
+		if id, ok := key.(string); ok {
+			if _, present := remoteIDs[id]; !present {
+				staleIDs = append(staleIDs, id)
+			}
+		}
+		return true
+	})
+	for _, id := range staleIDs {
+		if existing, ok := t.taskList.Load(id); ok {
+			if link, valid := existing.(*linkTask); valid {
+				link.StopTask()
+				link.sceneConfig.MsgId = msg.Id
+				if err := link.DeleteTask(); err != nil {
+					log.Errorf("delete stale scene %s failed: %v", id, err)
+					errCode = ErrorCodeFail
+				} else {
+					t.taskList.Delete(id)
+				}
+			}
+		}
 	}
 
 	return errCode
