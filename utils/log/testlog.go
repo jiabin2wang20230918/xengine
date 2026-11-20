@@ -47,7 +47,7 @@ func (t *TestLog) Output(calldepth int, s string) {
 		file = "???"
 		line = 0
 	} else {
-		file = filepath.Base(file) //strings.Split(file, "danbay-sass/")[1]
+		file = filepath.Base(file)
 	}
 
 	logBuf := fmt.Sprintf("%s %s:%d %s", now, file, line, s)

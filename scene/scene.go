@@ -1,64 +1,48 @@
-// Package scene 提供场景的计算能力。
-// 计算场景是否匹配。重点关注触发器（trigger）,条件（condition）
+// Package scene evaluates scene triggers and conditions and dispatches recall notifications.
 //
-//  - trigger:  或 的关系，满足其一即可。
-//  - condition: 和 的关系，所有条件满足。
-//
-// 当任意trigger满足时，检查场景旗下所有condition，满足条件后，通知其他模块执行。
-// trigger和condition的文档参考 http://doc.danbay.cn/web/#/3?page_id=322
-//
-// 提供接口:
-// 	- AddScene 用于添加场景的监控
-//  - RemoveScene 用于移除场景的监控
-//  - PropertyTriggerCheck 属性触发器检查，用于检查这个属性是否匹配场景中的属性触发器。
-//  - EventTriggerCheck 事件触发器检查，用于检查这个事件是否匹配场景中的场景触发器。
-//
-// 依赖：
-//  - compare 用于对比是否匹配
-//  - shadow 用于条件的对比
+// Triggers use OR semantics (any matching trigger evaluates the scene).
+// Conditions use AND semantics (all conditions must match to fire the scene action).
 package scene
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
+	"strings"
+	"sync"
+
 	beehiveContext "github.com/kubeedge/beehive/pkg/core/context"
 	"github.com/robfig/cron/v3"
+
 	"github.com/jiabin2wang20230918/xengine/utils"
 	"github.com/jiabin2wang20230918/xengine/utils/log"
 	"github.com/jiabin2wang20230918/xengine/utils/message"
-	"strings"
 )
 
-// Scene scene模块一个场景的基础单位，缓存要关心的 triggers 和 conditions
-type Scene struct {
-	Id uint16
-
-	// PropertyTriggers 属性触发器 key deviceId
-	PropertyTriggers map[string][]*PropertyCondition
-
-	// EventTriggers 事件触发器 key deviceId
-	EventTriggers map[string][]*EventCondition
-
-	// PropertyConditions 属性条件
-	PropertyConditions []*PropertyCondition
-
-	// TimeConditions 时间条件
-	TimeConditions []*TimeCondition
-
-	// TickerTriggers 时间触发器
-	TickerTriggers []*TickerTrigger
-
-	// corn 时间触发器执行器
-	corn *cron.Cron
-
-	// ActionNotifyModuleName action时发向消息的模块
-	ActionNotifyModuleName string
+type sceneEntry struct {
+	id                     uint16
+	propertyTriggers       map[string][]*propertyCondition
+	eventTriggers          map[string][]*eventCondition
+	propertyConditions     []*propertyCondition
+	timeConditions         []*timeCondition
+	tickerTriggers         []*tickerTrigger
+	cron                   *cron.Cron
+	actionNotifyModuleName string
 }
 
-// defaultCacheScene 场景缓存，key sceneId
-var defaultCacheScene = make(map[uint16]*Scene)
+var (
+	cacheMu           sync.RWMutex
+	defaultCacheScene = make(map[uint16]*sceneEntry)
 
-// SceneParams 场景的参数
+	sendActionMu sync.RWMutex
+	sendAction   = defaultSendAction
+)
+
+func defaultSendAction(moduleName string, sceneID uint16) {
+	beehiveContext.Send(moduleName, *message.BuildMsg("", "", "scene", "", utils.SceneActionRecallOperation, sceneID))
+}
+
+// SceneParams defines inputs for registering a scene in the engine.
 type SceneParams struct {
 	Id                     uint16          `json:"id"`
 	Triggers               json.RawMessage `json:"triggers"`
@@ -66,263 +50,257 @@ type SceneParams struct {
 	ActionNotifyModuleName string
 }
 
-// AddScene 添加场景监控
-// scene模块的id不关联业务信息（是云端sceneId还是南向的sceneId都不关心），只是用作key存储和通知别的模块执行此id的场景。
-// ActionNotifyModuleName 参数用于指向场景满足时发向的模块名称。
-// Triggers/Conditions 和云端协议保持一致的原始json数据。
+// AddScene parses and registers a scene. If a scene with the same Id already exists,
+// its previous cron scheduler is stopped before replacement.
 func AddScene(params *SceneParams) error {
-
-	s := &Scene{
-		Id:                     params.Id,
-		ActionNotifyModuleName: params.ActionNotifyModuleName,
-		PropertyTriggers:       make(map[string][]*PropertyCondition),
-		EventTriggers:          make(map[string][]*EventCondition),
-		PropertyConditions:     make([]*PropertyCondition, 0),
+	if params == nil {
+		return errors.New("scene params is nil")
 	}
-	// 条件部分处理
-	err := s.initConditions(params.Conditions)
-	if err != nil {
+
+	s := &sceneEntry{
+		id:                     params.Id,
+		actionNotifyModuleName: params.ActionNotifyModuleName,
+		propertyTriggers:       make(map[string][]*propertyCondition),
+		eventTriggers:          make(map[string][]*eventCondition),
+		propertyConditions:     make([]*propertyCondition, 0),
+	}
+
+	if err := s.initConditions(params.Conditions); err != nil {
+		return err
+	}
+	if err := s.initTriggers(params.Triggers); err != nil {
+		return err
+	}
+	if err := s.prepareTickerTriggers(); err != nil {
 		return err
 	}
 
-	// 触发器部分处理
-	err = s.initTriggers(params.Triggers)
-	if err != nil {
-		return err
-	}
-
+	cacheMu.Lock()
+	old := defaultCacheScene[params.Id]
 	defaultCacheScene[params.Id] = s
+	if s.cron != nil {
+		s.cron.Start()
+	}
+	cacheMu.Unlock()
 
-	s.tickerTriggerStart()
+	if old != nil && old.cron != nil {
+		old.cron.Stop()
+	}
 	return nil
 }
 
-// RemoveScene 移除场景监控
+// RemoveScene stops any scheduled triggers for id and removes the scene from the cache.
 func RemoveScene(id uint16) {
+	cacheMu.Lock()
 	s, ok := defaultCacheScene[id]
 	if ok {
-		if s.corn != nil {
-			s.corn.Stop()
-		}
 		delete(defaultCacheScene, id)
 	}
+	cacheMu.Unlock()
+
+	if ok && s.cron != nil {
+		s.cron.Stop()
+	}
 }
 
-// PropertyTriggerCheck 属性触发器检查
-// 检查所有场景是否触发
+func snapshotScenes() []*sceneEntry {
+	cacheMu.RLock()
+	defer cacheMu.RUnlock()
+	scenes := make([]*sceneEntry, 0, len(defaultCacheScene))
+	for _, s := range defaultCacheScene {
+		scenes = append(scenes, s)
+	}
+	return scenes
+}
+
+// PropertyTriggerCheck checks all registered scenes for a matching property trigger.
 func PropertyTriggerCheck(deviceId string, propertyName string, propertyValue interface{}) {
-	for _, scene := range defaultCacheScene {
-		scene.PropertyTriggerCheck(deviceId, propertyName, propertyValue)
+	for _, s := range snapshotScenes() {
+		s.propertyTriggerCheck(deviceId, propertyName, propertyValue)
 	}
 }
 
-// EventTriggerCheck 事件触发器检查
-// 检查所有场景是否触发
+// EventTriggerCheck checks all registered scenes for a matching event trigger.
 func EventTriggerCheck(deviceId string, eventName string) {
-	for _, scene := range defaultCacheScene {
-		scene.EventTriggerCheck(deviceId, eventName)
+	for _, s := range snapshotScenes() {
+		s.eventTriggerCheck(deviceId, eventName)
 	}
 }
 
-// PropertyTriggerCheck 属性触发器检查
-// 检查本场景是否触发
-func (s *Scene) PropertyTriggerCheck(deviceId string, propertyName string, propertyValue interface{}) {
-	triggers, ok := s.PropertyTriggers[deviceId]
+func (s *sceneEntry) propertyTriggerCheck(deviceId string, propertyName string, propertyValue interface{}) {
+	triggers, ok := s.propertyTriggers[deviceId]
 	if !ok {
 		return
 	}
 	for _, trigger := range triggers {
-		if trigger.Match(propertyName, propertyValue) {
-			log.Infof("property trigger of scene(%v) match.device id:%v, property name:%v, property value:%v", s.Id, deviceId, propertyName, propertyValue)
-			// check condition
+		if trigger.match(propertyName, propertyValue) {
+			log.Infof("property trigger of scene(%v) match.device id:%v, property name:%v, property value:%v", s.id, deviceId, propertyName, propertyValue)
 			s.checkAndAction()
 		}
 	}
 }
 
-// EventTriggerCheck 事件触发器检查
-// 检查本场景是否触发
-func (s *Scene) EventTriggerCheck(deviceId string, eventName string) {
-	triggers, ok := s.EventTriggers[deviceId]
+func (s *sceneEntry) eventTriggerCheck(deviceId string, eventName string) {
+	triggers, ok := s.eventTriggers[deviceId]
 	if !ok {
 		return
 	}
 	for _, trigger := range triggers {
-		if trigger.Match(eventName) {
-			log.Infof("event trigger of scene(%v) match.device id:%v, event name:%v", s.Id, deviceId, eventName)
-			// check condition
+		if trigger.match(eventName) {
+			log.Infof("event trigger of scene(%v) match.device id:%v, event name:%v", s.id, deviceId, eventName)
 			s.checkAndAction()
 		}
 	}
 }
 
-// tickerTriggerStart 时间触发器开启，使用定时器，定时触发
-func (s *Scene) tickerTriggerStart() {
-	if len(s.TickerTriggers) == 0 {
-		return
+func (s *sceneEntry) prepareTickerTriggers() error {
+	if len(s.tickerTriggers) == 0 {
+		return nil
 	}
-	if s.corn == nil {
-		s.corn = cron.New(cron.WithSeconds())
-	}
-	for _, ticker := range s.TickerTriggers {
-		_, err := s.corn.AddFunc(ticker.CronString, func() {
-			log.Infof("timer trigger of scene(%v) match.", s.Id)
+	c := cron.New(cron.WithSeconds())
+	for _, ticker := range s.tickerTriggers {
+		if _, err := c.AddFunc(ticker.cronString, func() {
+			log.Infof("timer trigger of scene(%v) match.", s.id)
 			s.checkAndAction()
-		})
-		if err != nil {
-			log.Errorf("err:%v", err)
-			return
+		}); err != nil {
+			log.Errorf("invalid timer trigger cron(%s): %v", ticker.cronString, err)
+			return fmt.Errorf("invalid timer trigger cron %q: %w", ticker.cronString, err)
 		}
 	}
-	s.corn.Start()
+	s.cron = c
+	return nil
 }
 
-// checkAndAction 检查条件并响应
-// 如果所有条件满足则执行场景
-func (s *Scene) checkAndAction() {
+func (s *sceneEntry) checkAndAction() {
 	if s.allConditionMatch() {
 		go s.action()
 	}
 }
 
-// allConditionMatch 所有条件是否匹配
-func (s *Scene) allConditionMatch() bool {
-	for _, condition := range s.PropertyConditions {
-		if !condition.IsMatch() {
+func (s *sceneEntry) allConditionMatch() bool {
+	for _, condition := range s.propertyConditions {
+		if !condition.isMatch() {
 			return false
 		}
 	}
-	for _, condition := range s.TimeConditions {
-		if !condition.IsMatch() {
+	for _, condition := range s.timeConditions {
+		if !condition.isMatch() {
 			return false
 		}
 	}
 	return true
 }
 
-// action 响应action
-// 本模块的action负责将要执行的 id 发送指定模块。
-func (s *Scene) action() {
-	log.Infof("will execute scene id:%v", s.Id)
-	beehiveContext.Send(s.ActionNotifyModuleName, *message.BuildMsg("", "", "scene", "", utils.SceneActionRecallOperation, s.Id))
+func (s *sceneEntry) action() {
+	log.Infof("will execute scene id:%v", s.id)
+	sendActionMu.RLock()
+	fn := sendAction
+	sendActionMu.RUnlock()
+	if fn != nil {
+		fn(s.actionNotifyModuleName, s.id)
+	}
 }
 
-// initConditions 初始化条件相关信息，加载信息到缓存中。
-func (s *Scene) initConditions(conditionsBytes []byte) error {
-	if conditionsBytes == nil || len(conditionsBytes) == 0 {
+func (s *sceneEntry) initConditions(conditionsBytes []byte) error {
+	if len(conditionsBytes) == 0 {
 		log.Infof("empty condition")
 		return nil
 	}
-	conditions := []CloudSceneConditionParams{}
-	err := json.Unmarshal(conditionsBytes, &conditions)
-	if err != nil {
+	var conditions []cloudSceneConditionParams
+	if err := json.Unmarshal(conditionsBytes, &conditions); err != nil {
 		return err
 	}
 	for _, condition := range conditions {
-		if condition.Type == utils.CloudConditionTypeProperty {
-			propertyCondition := &PropertyCondition{
+		switch condition.Type {
+		case utils.CloudConditionTypeProperty:
+			s.propertyConditions = append(s.propertyConditions, &propertyCondition{
 				deviceId:      condition.DeviceId,
 				propertyName:  condition.Identifier,
 				propertyValue: condition.Value,
 				symbol:        condition.Condition,
-			}
-			s.PropertyConditions = append(s.PropertyConditions, propertyCondition)
-		} else if condition.Type == utils.CloudConditionTypeTimer {
-			timeCondition := &TimeCondition{
+			})
+		case utils.CloudConditionTypeTimer:
+			s.timeConditions = append(s.timeConditions, &timeCondition{
 				startTime: condition.StartTime,
 				endTime:   condition.EndTime,
 				time:      condition.Time,
-			}
-			s.TimeConditions = append(s.TimeConditions, timeCondition)
-		} else {
-			log.Errorf("unsupported type! data:%v", condition)
+			})
+		default:
+			log.Errorf("unsupported condition type! data:%v", condition)
 		}
 	}
 	return nil
 }
 
-// initTriggers 初始化trigger相关信息，加载信息到缓存中。
-func (s *Scene) initTriggers(triggersBytes []byte) error {
-	triggersParams := []CloudSceneConditionParams{}
-	err := json.Unmarshal(triggersBytes, &triggersParams)
-	if err != nil {
+func (s *sceneEntry) initTriggers(triggersBytes []byte) error {
+	var triggersParams []cloudSceneConditionParams
+	if err := json.Unmarshal(triggersBytes, &triggersParams); err != nil {
 		return err
 	}
 	for _, trigger := range triggersParams {
-		if trigger.Type == utils.CloudTriggerTypeProperty {
-			propertyCondition := &PropertyCondition{
+		switch trigger.Type {
+		case utils.CloudTriggerTypeProperty:
+			pc := &propertyCondition{
 				deviceId:      trigger.DeviceId,
 				propertyName:  trigger.Identifier,
 				propertyValue: trigger.Value,
 				symbol:        trigger.Condition,
 			}
-			triggers, ok := s.PropertyTriggers[trigger.DeviceId]
-			if !ok {
-				triggers = make([]*PropertyCondition, 0)
+			s.propertyTriggers[trigger.DeviceId] = append(s.propertyTriggers[trigger.DeviceId], pc)
+		case utils.CloudTriggerTypeEvent:
+			ec := &eventCondition{eventName: trigger.Identifier}
+			s.eventTriggers[trigger.DeviceId] = append(s.eventTriggers[trigger.DeviceId], ec)
+		case utils.CloudTriggerTypeTimer:
+			cronExpr, err := parseTriggerTime(trigger.Time)
+			if err != nil {
+				return err
 			}
-			triggers = append(triggers, propertyCondition)
-			s.PropertyTriggers[trigger.DeviceId] = triggers
-		} else if trigger.Type == utils.CloudTriggerTypeEvent {
-			e := &EventCondition{eventName: trigger.Identifier}
-			triggers, ok := s.EventTriggers[trigger.DeviceId]
-			if !ok {
-				triggers = make([]*EventCondition, 0)
-			}
-			triggers = append(triggers, e)
-			s.EventTriggers[trigger.DeviceId] = triggers
-		} else if trigger.Type == utils.CloudTriggerTypeTimer {
-			temp := s.parseTriggerTime(trigger.Time)
-			log.Debugf("cron:%s", temp)
-			t := &TickerTrigger{CronString: temp}
-			if s.TickerTriggers == nil {
-				s.TickerTriggers = make([]*TickerTrigger, 0)
-			}
-			s.TickerTriggers = append(s.TickerTriggers, t)
-		} else {
-			log.Errorf("unsupported type! data:%v", trigger)
+			log.Debugf("cron:%s", cronExpr)
+			s.tickerTriggers = append(s.tickerTriggers, &tickerTrigger{cronString: cronExpr})
+		default:
+			log.Errorf("unsupported trigger type! data:%v", trigger)
 		}
 	}
 	return nil
 }
 
-// parseTriggerTime 转换时间
-// robfig/cron库的协议与云端的协议并非一致，需要对时间进行换算。
-//
-// 1. 去掉年，robfig/cron库不支持年
-// 2. 周日-周六 库为0-6 云端协议为1-7 将云端的数据-1
-func (s Scene) parseTriggerTime(time string) string {
-	split := strings.Split(time, " ")
+// parseTriggerTime converts a 7-field cloud cron string into a 6-field robfig/cron expression:
+// 1. drops the trailing year field (unsupported by robfig/cron);
+// 2. shifts numeric weekday values from 1-7 (SUN-SAT) to 0-6 without altering any /step divisor.
+func parseTriggerTime(expr string) (string, error) {
+	split := strings.Fields(expr)
 	if len(split) < 7 {
-		return ""
+		return "", fmt.Errorf("invalid trigger cron %q: expected 7 fields, got %d", expr, len(split))
 	}
 
-	weekString := split[5]
-
-	result := fmt.Sprintf("%s %s %s %s %s ", split[0], split[1], split[2], split[3], split[4])
-	for _, c := range weekString {
-		switch c {
-		case '1':
-			result += "0"
-		case '2':
-			result += "1"
-		case '3':
-			result += "2"
-		case '4':
-			result += "3"
-		case '5':
-			result += "4"
-		case '6':
-			result += "5"
-		case '7':
-			result += "6"
-		default:
-			result += string(c)
-		}
-	}
-	return result
+	convertedWeek := convertCloudWeekdayField(split[5])
+	return fmt.Sprintf("%s %s %s %s %s %s", split[0], split[1], split[2], split[3], split[4], convertedWeek), nil
 }
 
-type CloudSceneConditionParams struct {
+func convertCloudWeekdayField(weekField string) string {
+	parts := strings.Split(weekField, ",")
+	for i, part := range parts {
+		base := part
+		suffix := ""
+		if idx := strings.IndexByte(part, '/'); idx >= 0 {
+			base = part[:idx]
+			suffix = part[idx:]
+		}
+		var b strings.Builder
+		for _, c := range base {
+			if c >= '1' && c <= '7' {
+				b.WriteRune(c - 1)
+			} else {
+				b.WriteRune(c)
+			}
+		}
+		b.WriteString(suffix)
+		parts[i] = b.String()
+	}
+	return strings.Join(parts, ",")
+}
+
+type cloudSceneConditionParams struct {
 	StartTime  string      `json:"startTime,omitempty"`
 	EndTime    string      `json:"endTime,omitempty"`
 	Time       string      `json:"time,omitempty"`
